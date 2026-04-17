@@ -79,25 +79,33 @@ class MasterStrategy(Strategy):
 
     def generate_signal(self, df, candle_info, indicators) -> dict:
         buy_w = sell_w = 0
-        confs: list[float] = []
-        reasons: list[str] = []
+        buy_wconf = sell_wconf = 0.0   # weighted confidence sums
+        buy_reasons: list[str] = []
+        sell_reasons: list[str] = []
 
         for strat, w in self._strats:
             r = strat.generate_signal(df, candle_info, indicators)
             if r["signal"] == "BUY":
-                buy_w += w; confs.append(r["confidence"])
-                reasons.append(r["reason"])
+                buy_w += w
+                buy_wconf += r["confidence"] * w
+                buy_reasons.append(r["reason"])
             elif r["signal"] == "SELL":
-                sell_w += w; confs.append(r["confidence"])
-                reasons.append(r["reason"])
+                sell_w += w
+                sell_wconf += r["confidence"] * w
+                sell_reasons.append(r["reason"])
 
-        avg_conf = int(sum(confs) / len(confs)) if confs else 0
+        if buy_w > sell_w and buy_w >= 2:
+            conf = int(buy_wconf / buy_w)
+            if conf >= SIGNAL_CONFIDENCE_THRESHOLD:
+                return {"signal": "BUY", "confidence": conf, "reason": " | ".join(buy_reasons[:2])}
+        if sell_w > buy_w and sell_w >= 2:
+            conf = int(sell_wconf / sell_w)
+            if conf >= SIGNAL_CONFIDENCE_THRESHOLD:
+                return {"signal": "SELL", "confidence": conf, "reason": " | ".join(sell_reasons[:2])}
 
-        if buy_w > sell_w and buy_w >= 2 and avg_conf >= SIGNAL_CONFIDENCE_THRESHOLD:
-            return {"signal": "BUY", "confidence": avg_conf, "reason": " | ".join(reasons[:2])}
-        if sell_w > buy_w and sell_w >= 2 and avg_conf >= SIGNAL_CONFIDENCE_THRESHOLD:
-            return {"signal": "SELL", "confidence": avg_conf, "reason": " | ".join(reasons[:2])}
-        return {"signal": "HOLD", "confidence": avg_conf or 0, "reason": "No consensus"}
+        # HOLD: show best available confidence from dominant side
+        best_conf = int(buy_wconf / buy_w) if buy_w else (int(sell_wconf / sell_w) if sell_w else 0)
+        return {"signal": "HOLD", "confidence": best_conf, "reason": "No consensus"}
 
 
 STRATEGIES: dict[str, type[Strategy]] = {

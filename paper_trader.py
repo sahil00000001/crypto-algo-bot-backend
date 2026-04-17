@@ -57,6 +57,8 @@ class PaperTrader:
         self._initial = initial_balance
         self._positions: dict[str, Position] = {}
         self._trades: list[Trade] = []
+        self._peak_equity = initial_balance
+        self._max_dd_pct = 0.0
 
     def buy(self, symbol: str, price: float, pct_of_balance: float = MAX_POSITION_PCT) -> Optional[Trade]:
         if symbol in self._positions or price <= 0:
@@ -129,7 +131,15 @@ class PaperTrader:
     def get_total_value(self, prices: dict[str, float]) -> float:
         pos_val = sum(p.quantity * prices.get(s, p.entry_price)
                       for s, p in self._positions.items())
-        return round(self._balance + pos_val, 2)
+        total = round(self._balance + pos_val, 2)
+        # Track peak equity for max drawdown
+        if total > self._peak_equity:
+            self._peak_equity = total
+        elif self._peak_equity > 0:
+            dd = (self._peak_equity - total) / self._peak_equity * 100
+            if dd > self._max_dd_pct:
+                self._max_dd_pct = dd
+        return total
 
     def get_trades(self) -> list[dict]:
         return [t.to_dict() for t in self._trades]
@@ -150,5 +160,5 @@ class PaperTrader:
             "best_trade": round(max((t.pnl for t in sells), default=0.0), 2),
             "worst_trade": round(min((t.pnl for t in sells), default=0.0), 2),
             "return_pct": round(total_pnl / self._initial * 100, 2),
-            "max_drawdown": 0.0,
+            "max_drawdown": round(self._max_dd_pct, 2),
         }
