@@ -1,4 +1,4 @@
-# data_fetcher.py — REST API calls to Binance public endpoints (no API key required)
+# data_fetcher.py — Bybit public REST API (no API key, no geo-restriction)
 
 import time
 import logging
@@ -8,21 +8,23 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config import BINANCE_BASE_URL, REQUEST_DELAY, MAX_RETRIES
+from config import BYBIT_BASE_URL, REQUEST_DELAY, MAX_RETRIES, INTERVAL_MAP
 
 logger = logging.getLogger(__name__)
 
 
-def _get(endpoint: str, params: dict) -> dict | list:
-    """Make a GET request to Binance REST API with retry logic."""
-    url = f"{BINANCE_BASE_URL}/{endpoint}"
+def _get(endpoint: str, params: dict) -> dict:
+    url = f"{BYBIT_BASE_URL}/{endpoint}"
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
+            data = resp.json()
+            if data.get("retCode", 0) != 0:
+                raise ValueError(f"Bybit error: {data.get('retMsg')}")
             time.sleep(REQUEST_DELAY)
-            return resp.json()
-        except requests.exceptions.RequestException as e:
+            return data["result"]
+        except Exception as e:
             logger.warning(f"Request failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(1 * (attempt + 1))
@@ -31,23 +33,27 @@ def _get(endpoint: str, params: dict) -> dict | list:
 
 def get_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     """
-    Fetch OHLCV candle data from Binance.
-    Returns a DataFrame with computed candle metrics.
+    Fetch OHLCV candle data from Bybit.
+    Returns DataFrame with computed candle metrics.
     """
-    raw: list = _get("klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    bybit_interval = INTERVAL_MAP.get(interval, interval)
+    result = _get("kline", {
+        "category": "spot",
+        "symbol": symbol,
+        "interval": bybit_interval,
+        "limit": min(limit, 1000),
+    })
 
-    df = pd.DataFrame(raw, columns=[
-        "timestamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "num_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
+    # Bybit returns newest-first → reverse to oldest-first
+    rows = list(reversed(result["list"]))
 
-    # Convert types
-    numeric_cols = ["open", "high", "low", "close", "volume", "quote_volume"]
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+
+    numeric_cols = ["open", "high", "low", "close", "volume"]
     df[numeric_cols] = df[numeric_cols].astype(float)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    df["num_trades"] = df["num_trades"].astype(int)
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype(float), unit="ms")
+    df.drop(columns=["turnover"], inplace=True)
+    df["num_trades"] = 0
 
     # Computed candle metrics
     df["is_up"] = df["close"] >= df["open"]
@@ -58,63 +64,46 @@ def get_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     df["body_pct"] = np.where(
         df["candle_range"] > 0,
         df["body_size"] / df["candle_range"],
-        0.0
+        0.0,
     )
 
-    # Drop unused columns
-    df.drop(columns=["close_time", "quote_volume", "taker_buy_base", "taker_buy_quote", "ignore"], inplace=True)
     df.reset_index(drop=True, inplace=True)
-
     return df
 
 
 def get_current_price(symbol: str) -> float:
-    """Fetch current price for a symbol."""
-    data: dict = _get("ticker/price", {"symbol": symbol})
-    return float(data["price"])
+    result = _get("tickers", {"category": "spot", "symbol": symbol})
+    return float(result["list"][0]["lastPrice"])
 
 
 def get_ticker_24hr(symbol: str) -> dict:
-    """Fetch 24-hour statistics for a symbol."""
-    data: dict = _get("ticker/24hr", {"symbol": symbol})
+    result = _get("tickers", {"category": "spot", "symbol": symbol})
+    t = result["list"][0]
     return {
-        "symbol": data["symbol"],
-        "price": float(data["lastPrice"]),
-        "price_change": float(data["priceChange"]),
-        "price_change_pct": float(data["priceChangePercent"]),
-        "high_24h": float(data["highPrice"]),
-        "low_24h": float(data["lowPrice"]),
-        "volume_24h": float(data["volume"]),
-        "quote_volume_24h": float(data["quoteVolume"]),
+        "symbol": t["symbol"],
+        "price": float(t["lastPrice"]),
+        "price_change": float(t["price24hPcnt"]) * float(t["lastPrice"]),
+        "price_change_pct": float(t["price24hPcnt"]) * 100,
+        "high_24h": float(t["highPrice24h"]),
+        "low_24h": float(t["lowPrice24h"]),
+        "volume_24h": float(t["volume24h"]),
+        "quote_volume_24h": float(t["turnover24h"]),
     }
 
 
 def get_order_book(symbol: str, limit: int = 20) -> dict:
-    """Fetch current order book (bids and asks)."""
-    data: dict = _get("depth", {"symbol": symbol, "limit": limit})
+    result = _get("orderbook", {"category": "spot", "symbol": symbol, "limit": limit})
     return {
-        "bids": [[float(p), float(q)] for p, q in data["bids"]],
-        "asks": [[float(p), float(q)] for p, q in data["asks"]],
+        "bids": [[float(p), float(q)] for p, q in result["b"]],
+        "asks": [[float(p), float(q)] for p, q in result["a"]],
     }
 
 
-def get_recent_trades(symbol: str, limit: int = 50) -> list[dict]:
-    """Fetch recent trades for a symbol."""
-    trades: list = _get("trades", {"symbol": symbol, "limit": limit})
-    return [
-        {
-            "id": t["id"],
-            "price": float(t["price"]),
-            "qty": float(t["qty"]),
-            "time": t["time"],
-            "is_buyer_maker": t["isBuyerMaker"],
-        }
-        for t in trades
-    ]
-
-
 def get_multiple_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch current prices for multiple symbols."""
-    prices: list = _get("ticker/price", {})
-    price_map = {item["symbol"]: float(item["price"]) for item in prices}
-    return {s: price_map.get(s, 0.0) for s in symbols}
+    prices = {}
+    for symbol in symbols:
+        try:
+            prices[symbol] = get_current_price(symbol)
+        except Exception:
+            prices[symbol] = 0.0
+    return prices
