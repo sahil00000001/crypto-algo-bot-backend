@@ -1,11 +1,10 @@
-# server.py — FastAPI server: REST endpoints + WebSocket broadcast for web dashboard
+# server.py — FastAPI server with Bybit WebSocket + CoinGecko REST
 
 import asyncio
 import json
 import logging
 import threading
 import time
-from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,8 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import candle_analysis as ca
 import indicators as ind
-from config import PAIRS, DEFAULT_INTERVAL, INITIAL_BALANCE, SERVER_HOST, SERVER_PORT, SMA_SHORT, SMA_LONG, SIGNAL_CONFIDENCE_THRESHOLD
-from data_fetcher import get_klines, get_ticker_24hr, get_multiple_prices
+from config import (PAIRS, DEFAULT_INTERVAL, INITIAL_BALANCE,
+                    SERVER_HOST, SERVER_PORT, SMA_SHORT, SMA_LONG,
+                    SIGNAL_CONFIDENCE_THRESHOLD)
+from data_fetcher import get_klines, get_multiple_prices, get_ticker_24hr, make_candle_row, _empty_df
 from paper_trader import PaperTrader
 from portfolio import Portfolio
 from strategy import get_strategy
@@ -24,14 +25,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Crypto Algo Bot", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── Global State ──────────────────────────────────────────────────────────────
 
@@ -39,14 +34,13 @@ trader = PaperTrader(INITIAL_BALANCE)
 portfolio = Portfolio(INITIAL_BALANCE)
 master_strategy = get_strategy("master")
 
-# Per-symbol data
-symbol_data: dict[str, dict] = {sym: {} for sym in PAIRS}
-candle_dfs: dict[str, pd.DataFrame] = {}
+candle_dfs: dict[str, pd.DataFrame] = {sym: _empty_df() for sym in PAIRS}
+live_prices: dict[str, float] = {sym: 0.0 for sym in PAIRS}
 streams: dict[str, LiveCandleStream] = {}
 
-# WebSocket clients connected to /ws/stream
 _ws_clients: list[WebSocket] = []
 _ws_lock = asyncio.Lock()
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 
 # ── WebSocket Broadcast ───────────────────────────────────────────────────────
@@ -65,49 +59,34 @@ async def broadcast(payload: dict) -> None:
 
 
 def broadcast_sync(payload: dict) -> None:
-    """Thread-safe broadcast from synchronous context."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast(payload), loop)
-    except RuntimeError:
-        pass
+    if _main_loop and _main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(broadcast(payload), _main_loop)
 
 
 # ── Candle Processing ─────────────────────────────────────────────────────────
 
 def process_closed_candle(symbol: str, candle) -> None:
-    """Called on every closed WebSocket candle. Runs analysis and strategy."""
-    df = candle_dfs.get(symbol)
-    if df is None or len(df) < 5:
-        return
+    global live_prices
+    live_prices[symbol] = candle.close
 
-    # Append the new closed candle
-    new_row = pd.DataFrame([{
-        "timestamp": pd.Timestamp(candle.open_time, unit="ms"),
-        "open": candle.open, "high": candle.high,
-        "low": candle.low, "close": candle.close,
-        "volume": candle.volume, "num_trades": candle.num_trades,
-        "is_up": candle.close >= candle.open,
-        "body_size": abs(candle.close - candle.open),
-        "upper_wick": candle.high - max(candle.open, candle.close),
-        "lower_wick": min(candle.open, candle.close) - candle.low,
-        "candle_range": candle.high - candle.low,
-        "body_pct": abs(candle.close - candle.open) / (candle.high - candle.low + 1e-10),
-    }])
+    df = candle_dfs.get(symbol, _empty_df())
+    new_row = pd.DataFrame([make_candle_row(candle)])
     df = pd.concat([df, new_row], ignore_index=True).tail(500)
     candle_dfs[symbol] = df
 
-    # Analysis
+    # Need at least 5 candles for any analysis
+    if len(df) < 5:
+        broadcast_sync({"type": "prices", "data": dict(live_prices)})
+        return
+
     candle_info = ca.analyze_candles(df)
     computed = ind.compute_all(df, SMA_SHORT, SMA_LONG)
     signal_result = master_strategy.generate_signal(df, candle_info)
 
     signal = signal_result["signal"]
     confidence = signal_result["confidence"]
-
-    # Paper trading
     current_price = candle.close
+
     auto_trade = None
     if signal == "BUY" and confidence >= SIGNAL_CONFIDENCE_THRESHOLD:
         trade = trader.buy(symbol, current_price)
@@ -120,50 +99,41 @@ def process_closed_candle(symbol: str, candle) -> None:
             portfolio.record_trade(trade.to_dict())
             auto_trade = trade.to_dict()
 
-    # Check SL/TP for ALL symbols
-    prices = {s: candle_dfs[s]["close"].iloc[-1] for s in candle_dfs if len(candle_dfs[s]) > 0}
     for sym in list(trader._positions.keys()):
-        p = prices.get(sym)
+        p = live_prices.get(sym, 0)
         if p:
             t = trader.check_stop_loss(sym, p) or trader.check_take_profit(sym, p)
             if t:
                 portfolio.record_trade(t.to_dict())
 
-    # Build snapshot
-    snapshot = build_snapshot(symbol, current_price, candle_info, computed, signal_result)
+    snap = build_snapshot(symbol, current_price, candle_info, computed, signal_result)
     if auto_trade:
-        snapshot["trade"] = auto_trade
-    broadcast_sync({"type": "update", "data": snapshot})
+        snap["trade"] = auto_trade
+    broadcast_sync({"type": "update", "data": snap})
 
 
-def build_snapshot(
-    symbol: str,
-    price: float,
-    candle_info: dict,
-    computed: dict,
-    signal_result: dict,
-) -> dict:
-    prices = {s: candle_dfs[s]["close"].iloc[-1] for s in candle_dfs if len(candle_dfs[s]) > 0}
-    positions = trader.get_all_positions(prices)
-    trader_stats = trader.get_stats()
-    total_value = trader.get_total_value(prices)
+def on_candle_update(symbol: str, candle) -> None:
+    """Broadcast live price on every tick (not just closed candles)."""
+    live_prices[symbol] = candle.close
+    broadcast_sync({"type": "prices", "data": dict(live_prices)})
+
+
+def build_snapshot(symbol: str, price: float, candle_info: dict,
+                   computed: dict, signal_result: dict) -> dict:
+    positions = trader.get_all_positions(live_prices)
+    total_value = trader.get_total_value(live_prices)
     portfolio.snapshot_equity(total_value)
 
+    df = candle_dfs.get(symbol, _empty_df())
     candles_list = []
-    df = candle_dfs.get(symbol)
-    if df is not None:
-        tail = df.tail(100)
-        candles_list = [
-            {
+    if not df.empty:
+        for _, row in df.tail(100).iterrows():
+            candles_list.append({
                 "time": int(row["timestamp"].timestamp()),
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
+                "open": row["open"], "high": row["high"],
+                "low": row["low"], "close": row["close"],
                 "volume": row["volume"],
-            }
-            for _, row in tail.iterrows()
-        ]
+            })
 
     return {
         "symbol": symbol,
@@ -174,53 +144,43 @@ def build_snapshot(
         "positions": positions,
         "balance": trader.get_balance(),
         "total_value": total_value,
-        "stats": trader_stats,
+        "stats": trader.get_stats(),
         "recent_trades": portfolio.get_recent_trades(10),
         "candles": candles_list,
         "equity_curve": portfolio.get_equity_curve()[-50:],
+        "candle_count": len(df),
     }
 
 
 # ── Background Init ───────────────────────────────────────────────────────────
 
 def init_background() -> None:
-    """Load historical data and start WebSocket streams."""
-    logger.info("Loading historical candle data…")
-    for symbol in PAIRS:
-        try:
-            df = get_klines(symbol, DEFAULT_INTERVAL, 500)
-            candle_dfs[symbol] = df
-            logger.info(f"Loaded {len(df)} candles for {symbol}")
-        except Exception as e:
-            logger.error(f"Failed to load {symbol}: {e}")
-            candle_dfs[symbol] = pd.DataFrame()
-
-    logger.info("Starting WebSocket streams…")
+    logger.info("Starting WebSocket streams (no REST init — builds from live data)…")
     for symbol in PAIRS:
         stream = LiveCandleStream(
             symbol=symbol,
             interval=DEFAULT_INTERVAL,
             on_candle_close=lambda c, s=symbol: process_closed_candle(s, c),
+            on_candle_update=lambda c, s=symbol: on_candle_update(s, c),
         )
         stream.start()
         streams[symbol] = stream
         logger.info(f"Stream started: {symbol}")
 
-    # Periodic price broadcast for the ticker bar
-    def ticker_loop():
+    # Broadcast live prices every 3s using WebSocket-derived data
+    def price_broadcast_loop():
         while True:
-            try:
-                prices = get_multiple_prices(PAIRS)
-                broadcast_sync({"type": "prices", "data": prices})
-            except Exception:
-                pass
+            if any(p > 0 for p in live_prices.values()):
+                broadcast_sync({"type": "prices", "data": dict(live_prices)})
             time.sleep(3)
 
-    threading.Thread(target=ticker_loop, daemon=True).start()
+    threading.Thread(target=price_broadcast_loop, daemon=True).start()
 
 
 @app.on_event("startup")
 async def startup_event():
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
     threading.Thread(target=init_background, daemon=True).start()
 
 
@@ -232,41 +192,47 @@ async def shutdown_event():
 
 # ── REST Endpoints ────────────────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    return {"status": "running", "pairs": PAIRS, "candles": {s: len(candle_dfs.get(s, [])) for s in PAIRS}}
+
+
 @app.get("/api/status")
 async def get_status():
     return {
         "pairs": PAIRS,
         "interval": DEFAULT_INTERVAL,
         "streams": {s: streams[s].is_connected() for s in streams},
+        "candle_counts": {s: len(candle_dfs.get(s, [])) for s in PAIRS},
+        "live_prices": live_prices,
     }
 
 
 @app.get("/api/candles/{symbol}")
 async def get_candles(symbol: str, limit: int = 100):
-    df = candle_dfs.get(symbol.upper())
-    if df is None or df.empty:
-        return {"candles": []}
+    df = candle_dfs.get(symbol.upper(), _empty_df())
+    if df.empty:
+        return {"candles": [], "count": 0}
     tail = df.tail(limit)
     return {
         "candles": [
-            {
-                "time": int(row["timestamp"].timestamp()),
-                "open": row["open"], "high": row["high"],
-                "low": row["low"], "close": row["close"],
-                "volume": row["volume"],
-            }
+            {"time": int(row["timestamp"].timestamp()),
+             "open": row["open"], "high": row["high"],
+             "low": row["low"], "close": row["close"], "volume": row["volume"]}
             for _, row in tail.iterrows()
-        ]
+        ],
+        "count": len(df),
     }
 
 
 @app.get("/api/snapshot/{symbol}")
 async def get_snapshot(symbol: str):
     sym = symbol.upper()
-    df = candle_dfs.get(sym)
-    if df is None or df.empty:
-        return {"error": "No data"}
-    price = float(df["close"].iloc[-1])
+    df = candle_dfs.get(sym, _empty_df())
+    price = live_prices.get(sym, 0)
+    if df.empty or len(df) < 5:
+        return {"symbol": sym, "price": price, "candle_count": len(df),
+                "message": f"Warming up… {len(df)} candles collected so far"}
     candle_info = ca.analyze_candles(df)
     computed = ind.compute_all(df, SMA_SHORT, SMA_LONG)
     signal_result = master_strategy.generate_signal(df, candle_info)
@@ -275,11 +241,10 @@ async def get_snapshot(symbol: str):
 
 @app.get("/api/portfolio")
 async def get_portfolio():
-    prices = {s: float(candle_dfs[s]["close"].iloc[-1]) for s in candle_dfs if len(candle_dfs.get(s, [])) > 0}
     return {
         "balance": trader.get_balance(),
-        "total_value": trader.get_total_value(prices),
-        "positions": trader.get_all_positions(prices),
+        "total_value": trader.get_total_value(live_prices),
+        "positions": trader.get_all_positions(live_prices),
         "stats": trader.get_stats(),
         "recent_trades": portfolio.get_recent_trades(20),
         "equity_curve": portfolio.get_equity_curve(),
@@ -288,13 +253,7 @@ async def get_portfolio():
 
 @app.get("/api/ticker")
 async def get_ticker():
-    result = {}
-    for symbol in PAIRS:
-        try:
-            result[symbol] = get_ticker_24hr(symbol)
-        except Exception:
-            result[symbol] = {}
-    return result
+    return {sym: {"symbol": sym, "price": live_prices.get(sym, 0)} for sym in PAIRS}
 
 
 # ── WebSocket Endpoint ────────────────────────────────────────────────────────
@@ -306,17 +265,20 @@ async def ws_stream(websocket: WebSocket):
         _ws_clients.append(websocket)
     logger.info("WS client connected")
     try:
-        # Send initial state for all pairs
+        # Send current state immediately
         for sym in PAIRS:
-            df = candle_dfs.get(sym)
-            if df is not None and not df.empty:
-                price = float(df["close"].iloc[-1])
+            df = candle_dfs.get(sym, _empty_df())
+            price = live_prices.get(sym, 0)
+            if len(df) >= 5:
                 candle_info = ca.analyze_candles(df)
                 computed = ind.compute_all(df, SMA_SHORT, SMA_LONG)
                 signal_result = master_strategy.generate_signal(df, candle_info)
                 snap = build_snapshot(sym, price, candle_info, computed, signal_result)
-                await websocket.send_text(json.dumps({"type": "init", "data": snap}))
-        # Keep alive
+            else:
+                snap = {"symbol": sym, "price": price, "candle_count": len(df),
+                        "candles": [], "message": "Warming up…"}
+            await websocket.send_text(json.dumps({"type": "init", "data": snap}))
+
         while True:
             await asyncio.sleep(30)
             await websocket.send_text(json.dumps({"type": "ping"}))
