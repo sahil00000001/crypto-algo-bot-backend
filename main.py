@@ -1,168 +1,123 @@
 #!/usr/bin/env python3
-# main.py — CLI entry point for the trading bot (terminal mode, no web UI)
+# main.py — Terminal CLI entry point
 
 import argparse
 import logging
 import signal
 import sys
-import time
 import threading
-
-import pandas as pd
+import time
 
 import candle_analysis as ca
 import indicators as ind
-from config import PAIRS, DEFAULT_INTERVAL, INITIAL_BALANCE, SIGNAL_CONFIDENCE_THRESHOLD, SMA_SHORT, SMA_LONG
-from data_fetcher import get_klines, get_ticker_24hr
+from candle_store import CandleStore
+from config import PAIRS, INITIAL_BALANCE, SIGNAL_CONFIDENCE_THRESHOLD
 from paper_trader import PaperTrader
 from portfolio import Portfolio
+from price_fallback import get_prices_coingecko
 from strategy import get_strategy
-from websocket_stream import LiveCandleStream
+from ws_stream import CryptoWebSocket
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("trades.log"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("trades.log")],
 )
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Crypto Algo Trading Bot")
-    parser.add_argument("--pairs", nargs="+", default=PAIRS, help="Trading pairs")
-    parser.add_argument("--strategy", default="master", choices=["candle", "trend", "rsi", "master"])
-    parser.add_argument("--interval", default=DEFAULT_INTERVAL, help="Candle interval (1m, 5m, 1h …)")
-    parser.add_argument("--balance", type=float, default=INITIAL_BALANCE, help="Starting USDT balance")
-    return parser.parse_args()
-
-
-def run_bot(pairs: list[str], strategy_name: str, interval: str, balance: float) -> None:
-    strategy = get_strategy(strategy_name)
+def run(pairs: list[str], strategy_name: str, balance: float) -> None:
+    store = CandleStore()
     trader = PaperTrader(balance)
     portfolio = Portfolio(balance)
-    candle_dfs: dict[str, pd.DataFrame] = {}
-    streams: dict[str, LiveCandleStream] = {}
-    lock = threading.Lock()
+    strat = get_strategy(strategy_name)
+    stop_event = threading.Event()
 
-    # ── Load historical data ──────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print("  CRYPTO ALGO TRADING BOT  — Paper Trading Mode")
-    print(f"  Strategy: {strategy_name.upper()} | Interval: {interval}")
-    print(f"  Pairs: {', '.join(pairs)} | Balance: ${balance:,.2f}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*55}")
+    print(f"  CRYPTO ALGO BOT  |  Strategy: {strategy_name.upper()}  |  ${balance:,.0f}")
+    print(f"  Pairs: {', '.join(pairs)}")
+    print(f"{'='*55}\n")
 
-    for symbol in pairs:
-        try:
-            print(f"Loading historical candles for {symbol}…")
-            df = get_klines(symbol, interval, 500)
-            candle_dfs[symbol] = df
-            print(f"  ✓ {symbol}: {len(df)} candles loaded")
-        except Exception as e:
-            logger.error(f"Failed to load {symbol}: {e}")
-            candle_dfs[symbol] = pd.DataFrame()
+    # Seed initial prices
+    try:
+        prices = get_prices_coingecko(pairs)
+        for sym, p in prices.items():
+            if p > 0:
+                store.set_price(sym, p)
+                print(f"  {sym}: ${p:,.2f} (CoinGecko)")
+    except Exception:
+        pass
 
-    # ── Candle close handler ──────────────────────────────────────────────────
-    def on_candle_close(candle, symbol: str) -> None:
-        with lock:
-            df = candle_dfs.get(symbol)
-            if df is None or df.empty:
-                return
+    def on_candle_close(symbol: str, candle: dict) -> None:
+        store.add_candle(symbol, candle)
+        count = store.get_count(symbol)
 
-            new_row = pd.DataFrame([{
-                "timestamp": pd.Timestamp(candle.open_time, unit="ms"),
-                "open": candle.open, "high": candle.high,
-                "low": candle.low, "close": candle.close,
-                "volume": candle.volume, "num_trades": candle.num_trades,
-                "is_up": candle.close >= candle.open,
-                "body_size": abs(candle.close - candle.open),
-                "upper_wick": candle.high - max(candle.open, candle.close),
-                "lower_wick": min(candle.open, candle.close) - candle.low,
-                "candle_range": candle.high - candle.low,
-                "body_pct": abs(candle.close - candle.open) / (candle.high - candle.low + 1e-10),
-            }])
-            df = pd.concat([df, new_row], ignore_index=True).tail(500)
-            candle_dfs[symbol] = df
+        if not store.is_ready(symbol):
+            print(f"  Warming {symbol}: {count}/26 candles")
+            return
 
-            candle_info = ca.analyze_candles(df)
-            computed = ind.compute_all(df, SMA_SHORT, SMA_LONG)
-            signal_result = strategy.generate_signal(df, candle_info)
+        df = store.get_dataframe(symbol)
+        ci = ca.analyze_candles(df)
+        comp = ind.compute_all(df)
+        sig = strat.generate_signal(df, ci, comp)
 
-            signal = signal_result["signal"]
-            confidence = signal_result["confidence"]
-            price = candle.close
-
-            marker = "🟢" if candle.is_up else "🔴"
-            print(
-                f"{marker} {symbol} | {price:>12,.4f} | "
-                f"Pattern: {candle_info['pattern']:<22} | "
-                f"RSI: {computed['rsi']:>5.1f} | "
-                f"Trend: {candle_info['trend']:<10} | "
-                f"Signal: {signal:<4} ({confidence}%)"
-            )
-
-            if signal == "BUY" and confidence >= SIGNAL_CONFIDENCE_THRESHOLD:
-                trade = trader.buy(symbol, price)
-                if trade:
-                    portfolio.record_trade(trade.to_dict())
-                    print(f"  ✅ BUY  {symbol} @ {price:.4f} | reason: {signal_result['reason'][:60]}")
-
-            elif signal == "SELL" and confidence >= SIGNAL_CONFIDENCE_THRESHOLD:
-                trade = trader.sell(symbol, price, reason="signal")
-                if trade:
-                    portfolio.record_trade(trade.to_dict())
-                    print(f"  ❌ SELL {symbol} @ {price:.4f} | pnl: ${trade.pnl:+.2f}")
-
-            # Check SL/TP
-            prices = {s: df["close"].iloc[-1] for s, df in candle_dfs.items() if not df.empty}
-            for sym in list(trader._positions.keys()):
-                p = prices.get(sym)
-                if p:
-                    t = trader.check_stop_loss(sym, p) or trader.check_take_profit(sym, p)
-                    if t:
-                        portfolio.record_trade(t.to_dict())
-
-            # Balance update
-            prices_now = {s: float(df["close"].iloc[-1]) for s, df in candle_dfs.items() if not df.empty}
-            total = trader.get_total_value(prices_now)
-            portfolio.snapshot_equity(total)
-
-    # ── Start streams ─────────────────────────────────────────────────────────
-    for symbol in pairs:
-        stream = LiveCandleStream(
-            symbol=symbol,
-            interval=interval,
-            on_candle_close=lambda c, s=symbol: on_candle_close(c, s),
+        price = candle["close"]
+        marker = "+" if candle["close"] >= candle["open"] else "-"
+        trend_sym = {"UPTREND": "^", "DOWNTREND": "v", "SIDEWAYS": "-"}[ci["trend"]]
+        print(
+            f"  [{marker}] {symbol} ${price:>12,.2f} | "
+            f"{ci['pattern']:<22} | RSI:{comp['rsi']:>5.1f} | "
+            f"Trend:{ci['trend']:<10} {trend_sym} | "
+            f"{sig['signal']:<4} ({sig['confidence']}%)"
         )
-        stream.start()
-        streams[symbol] = stream
-        print(f"  📡 WebSocket stream started: {symbol}")
 
-    print(f"\nBot running — watching {len(pairs)} pair(s). Press Ctrl+C to stop.\n")
+        if sig["signal"] == "BUY" and sig["confidence"] >= SIGNAL_CONFIDENCE_THRESHOLD:
+            t = trader.buy(symbol, price)
+            if t:
+                portfolio.record_trade(t.to_dict())
+                print(f"  >> BUY  {symbol} @ {price:.4f}")
+        elif sig["signal"] == "SELL" and sig["confidence"] >= SIGNAL_CONFIDENCE_THRESHOLD:
+            t = trader.sell(symbol, price)
+            if t:
+                portfolio.record_trade(t.to_dict())
+                print(f"  >> SELL {symbol} @ {price:.4f} | PnL: ${t.pnl:+.2f}")
 
-    # ── Graceful shutdown ─────────────────────────────────────────────────────
-    stop = threading.Event()
+        all_prices = store.get_all_prices()
+        for sym in list(trader._positions.keys()):
+            p = all_prices.get(sym, 0)
+            if p:
+                t = trader.check_stop_loss(sym, p) or trader.check_take_profit(sym, p)
+                if t:
+                    portfolio.record_trade(t.to_dict())
+        portfolio.snapshot_equity(trader.get_total_value(all_prices))
 
-    def handle_signal(*_):
-        stop.set()
+    def on_price_update(symbol: str, price: float) -> None:
+        store.set_price(symbol, price)
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    ws = CryptoWebSocket(on_candle_close=on_candle_close, on_price_update=on_price_update)
+    ws.start()
+    print("  WebSocket stream started. Waiting for candles...\n")
+
+    def handle_exit(*_):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
 
     try:
-        while not stop.is_set():
+        while not stop_event.is_set():
             time.sleep(1)
     finally:
-        print("\nShutting down…")
-        for stream in streams.values():
-            stream.stop()
+        ws.stop()
         portfolio.print_summary()
         portfolio.export_csv("trade_history.csv")
-        print("Trade history saved to trade_history.csv")
+        print("Saved: trade_history.csv")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run_bot(args.pairs, args.strategy, args.interval, args.balance)
+    p = argparse.ArgumentParser()
+    p.add_argument("--pairs", nargs="+", default=PAIRS)
+    p.add_argument("--strategy", default="master", choices=["candle", "trend", "rsi", "master"])
+    p.add_argument("--balance", type=float, default=INITIAL_BALANCE)
+    args = p.parse_args()
+    run(args.pairs, args.strategy, args.balance)
