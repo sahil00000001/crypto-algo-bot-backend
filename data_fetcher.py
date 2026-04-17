@@ -1,121 +1,90 @@
-# data_fetcher.py — CoinGecko for prices (unrestricted), Bybit WebSocket for candles
+# data_fetcher.py — Kraken REST for historical candles (NOT geo-blocked from cloud)
+# Kraken is a US-registered exchange with no IP restrictions on public data.
 
-import time
 import logging
+import time
 
 import numpy as np
 import pandas as pd
 import requests
 
-from config import MAX_RETRIES, REQUEST_DELAY
-
 logger = logging.getLogger(__name__)
 
-# CoinGecko — completely unrestricted, no API key, works everywhere
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+KRAKEN_BASE = "https://api.kraken.com/0/public"
 
-SYMBOL_TO_ID = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum",
-    "SOLUSDT": "solana",
+# Kraken pair names for each symbol
+KRAKEN_PAIRS: dict[str, str] = {
+    "BTCUSDT": "XBTUSD",
+    "ETHUSDT": "ETHUSD",
+    "SOLUSDT": "SOLUSD",
 }
 
-SYMBOL_TO_VS = {
-    "BTCUSDT": "usd",
-    "ETHUSDT": "usd",
-    "SOLUSDT": "usd",
+# Bybit interval → Kraken interval (minutes)
+KRAKEN_INTERVALS: dict[str, int] = {
+    "1": 1, "3": 5, "5": 5, "15": 15,
+    "30": 30, "60": 60, "1h": 60, "240": 240, "D": 1440,
 }
 
 
-def _get_cg(endpoint: str, params: dict) -> dict | list:
-    url = f"{COINGECKO_BASE}/{endpoint}"
-    for attempt in range(MAX_RETRIES):
+def get_klines(symbol: str, interval: str = "5", limit: int = 300) -> pd.DataFrame:
+    """
+    Fetch historical OHLCV candles from Kraken public REST API.
+    Kraken is NOT geo-blocked from US cloud servers (AWS/HuggingFace).
+    Returns a DataFrame pre-populated with all computed candle metrics.
+    """
+    pair = KRAKEN_PAIRS.get(symbol, "XBTUSD")
+    kraken_interval = KRAKEN_INTERVALS.get(str(interval), 5)
+
+    for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, timeout=10,
-                                headers={"Accept": "application/json"})
+            resp = requests.get(
+                f"{KRAKEN_BASE}/OHLC",
+                params={"pair": pair, "interval": kraken_interval},
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
             resp.raise_for_status()
-            time.sleep(REQUEST_DELAY)
-            return resp.json()
+            data = resp.json()
+
+            if data.get("error"):
+                raise ValueError(f"Kraken API error: {data['error']}")
+
+            result = data["result"]
+            # Kraken puts candles under the pair's internal key (skip "last")
+            pair_key = next(k for k in result if k != "last")
+            rows = result[pair_key]
+
+            df = pd.DataFrame(rows, columns=[
+                "timestamp", "open", "high", "low", "close", "vwap", "volume", "count"
+            ])
+            df = df.tail(limit).copy()
+
+            # Cast types
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            # Kraken timestamps are in seconds (not ms)
+            df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+            df.drop(columns=["vwap", "count"], inplace=True)
+
+            # Computed candle metrics
+            df["is_up"] = df["close"] >= df["open"]
+            df["body_size"] = (df["close"] - df["open"]).abs()
+            df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+            df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+            df["candle_range"] = df["high"] - df["low"]
+            df["body_pct"] = np.where(
+                df["candle_range"] > 0,
+                df["body_size"] / df["candle_range"],
+                0.0,
+            )
+            df.reset_index(drop=True, inplace=True)
+            logger.info(f"Kraken: {len(df)} candles loaded for {symbol} ({pair} {kraken_interval}m)")
+            return df
+
         except Exception as e:
-            logger.warning(f"CoinGecko request failed (attempt {attempt+1}): {e}")
-            if attempt < MAX_RETRIES - 1:
+            logger.warning(f"Kraken fetch attempt {attempt + 1}/3 failed for {symbol}: {e}")
+            if attempt < 2:
                 time.sleep(2 * (attempt + 1))
-    raise ConnectionError(f"CoinGecko {endpoint} failed after {MAX_RETRIES} retries")
 
-
-def get_current_price(symbol: str) -> float:
-    cg_id = SYMBOL_TO_ID.get(symbol, "bitcoin")
-    data = _get_cg("simple/price", {"ids": cg_id, "vs_currencies": "usd"})
-    return float(data[cg_id]["usd"])
-
-
-def get_multiple_prices(symbols: list[str]) -> dict[str, float]:
-    ids = ",".join(SYMBOL_TO_ID.get(s, "bitcoin") for s in symbols)
-    try:
-        data = _get_cg("simple/price", {"ids": ids, "vs_currencies": "usd"})
-        return {
-            sym: float(data.get(SYMBOL_TO_ID.get(sym, "bitcoin"), {}).get("usd", 0))
-            for sym in symbols
-        }
-    except Exception as e:
-        logger.warning(f"get_multiple_prices failed: {e}")
-        return {s: 0.0 for s in symbols}
-
-
-def get_ticker_24hr(symbol: str) -> dict:
-    cg_id = SYMBOL_TO_ID.get(symbol, "bitcoin")
-    try:
-        data = _get_cg(f"coins/{cg_id}", {
-            "localization": "false", "tickers": "false",
-            "market_data": "true", "community_data": "false",
-        })
-        md = data["market_data"]
-        price = float(md["current_price"]["usd"])
-        change_pct = float(md["price_change_percentage_24h"] or 0)
-        return {
-            "symbol": symbol,
-            "price": price,
-            "price_change": price * change_pct / 100,
-            "price_change_pct": change_pct,
-            "high_24h": float(md["high_24h"]["usd"]),
-            "low_24h": float(md["low_24h"]["usd"]),
-            "volume_24h": float(md["total_volume"]["usd"]),
-            "quote_volume_24h": float(md["total_volume"]["usd"]),
-        }
-    except Exception:
-        price = get_current_price(symbol)
-        return {"symbol": symbol, "price": price, "price_change_pct": 0,
-                "high_24h": price, "low_24h": price, "volume_24h": 0}
-
-
-def get_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-    """
-    Returns empty DataFrame — historical klines are built up live via WebSocket.
-    CoinGecko free tier only provides daily OHLC, not minute-level data.
-    """
-    logger.info(f"Skipping REST historical load for {symbol} — will build from WebSocket")
-    return _empty_df()
-
-
-def _empty_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=[
-        "timestamp", "open", "high", "low", "close", "volume", "num_trades",
-        "is_up", "body_size", "upper_wick", "lower_wick", "candle_range", "body_pct",
-    ])
-
-
-def make_candle_row(c) -> dict:
-    """Convert a WebSocket Candle object into a DataFrame row dict."""
-    body = abs(c.close - c.open)
-    rng = c.high - c.low
-    return {
-        "timestamp": pd.Timestamp(c.open_time, unit="ms"),
-        "open": c.open, "high": c.high, "low": c.low,
-        "close": c.close, "volume": c.volume, "num_trades": 0,
-        "is_up": c.close >= c.open,
-        "body_size": body,
-        "upper_wick": c.high - max(c.open, c.close),
-        "lower_wick": min(c.open, c.close) - c.low,
-        "candle_range": rng,
-        "body_pct": body / rng if rng > 0 else 0.0,
-    }
+    logger.error(f"Kraken: all retries failed for {symbol}, starting empty")
+    return pd.DataFrame()

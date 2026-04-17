@@ -14,6 +14,7 @@ import candle_analysis as ca
 import indicators as ind
 from candle_store import CandleStore
 from config import PAIRS, INITIAL_BALANCE, SMA_SHORT, SMA_LONG, SIGNAL_CONFIDENCE_THRESHOLD, SERVER_HOST, SERVER_PORT
+from data_fetcher import get_klines
 from paper_trader import PaperTrader
 from portfolio import Portfolio
 from price_fallback import get_prices_coingecko
@@ -165,6 +166,17 @@ def init_background() -> None:
         logger.info(f"Initial prices from CoinGecko: {prices}")
     except Exception as e:
         logger.warning(f"CoinGecko seed failed (non-fatal): {e}")
+
+    # Bootstrap chart with Kraken historical candles (not geo-blocked from US cloud)
+    for sym in PAIRS:
+        try:
+            df = get_klines(sym, interval="5", limit=300)
+            if not df.empty:
+                store.bulk_load_from_df(sym, df)
+                logger.info(f"Kraken bootstrap: loaded {len(df)} candles for {sym}")
+                broadcast_sync({"type": "kraken_bootstrap", "symbol": sym, "count": len(df)})
+        except Exception as e:
+            logger.warning(f"Kraken bootstrap failed for {sym} (non-fatal): {e}")
 
     # Start WebSocket
     ws_feed = CryptoWebSocket(

@@ -40,6 +40,32 @@ class CandleStore:
             self._current[symbol] = candle
             self._prices[symbol] = candle["close"]
 
+    def bulk_load_from_df(self, symbol: str, df: pd.DataFrame) -> None:
+        """
+        Seed the store with historical candles from a DataFrame (e.g. Kraken REST).
+        Each row must have: timestamp (datetime), open, high, low, close, volume.
+        Existing candles for the symbol are replaced.
+        """
+        if df.empty:
+            return
+        rows = []
+        for _, row in df.iterrows():
+            ts = row["timestamp"]
+            # Store timestamps as ms integers (consistent with WebSocket candles)
+            ts_ms = int(ts.timestamp() * 1000) if hasattr(ts, "timestamp") else int(ts)
+            rows.append({
+                "timestamp": ts_ms,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row["volume"]),
+            })
+        with self._lock:
+            self._candles[symbol] = rows[-MAX_CANDLES_STORED:]
+            if rows:
+                self._prices[symbol] = rows[-1]["close"]
+
     def set_price(self, symbol: str, price: float) -> None:
         with self._lock:
             self._prices[symbol] = price
